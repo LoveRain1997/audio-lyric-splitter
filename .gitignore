@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 运行产物（分析结果与切分输出不属于 skill 本体）
+analysis.json
+*_segments/
+*.zip
+*.wav
