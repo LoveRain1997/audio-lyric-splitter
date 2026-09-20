@@ -1,92 +1,83 @@
 ---
 name: audio-lyric-splitter
-description: "歌词感知的音乐/音频分段切割：把整首歌按逐句歌词时间轴(SRT)切成每段默认10–15秒的 mp3，切点绝不切进唱词、优先落在句间气口并尽量对齐节拍，输出分段 mp3 + cuts_manifest.json（含每段段内节奏点 beats、唱句 lyric_events、BPM/首拍网格）+ 可选 zip，专为 MiniMax H3 / AI 舞蹈视频多段生成准备素材。当用户要求切割/切分/分段/分割歌曲或音频、按歌词切歌、不切歌词地分段、H3分段、把 mp3 切成约15秒片段、提取节拍网格或段内节奏点、beat-aligned mp3 split、cut/split song by lyrics or SRT 时使用。需要逐句歌词 SRT；只给 BPM 或能量无法保证不切词。"
+description: "歌词感知、节拍对齐的 MP3 分段工具，用于把一整首歌切成 10–15 秒、绝不切断唱句、切点卡在气口/节拍上的 H3/多段视频素材，并输出每段段内节奏点(beats)与字位(lyric_events)的 manifest 和打包 zip。开始前必须先确认用户是否提供逐句歌词 SRT：有 SRT 直接切；没有歌词或只有音频时，先用 scripts/transcribe_lyrics.py 经 mediakit-cli ASR（唱歌 singing 模式、中/英文）识别出带时间戳的 SRT 草稿，人工校对后再切。触发场景：歌曲/音频分段、按歌词切割、不切歌词、节拍卡点、H3 多段、歌词时间轴 SRT、识别歌词、语音转字幕/ASR 生成歌词、生成 cuts_manifest.json、段内节奏点。"
 ---
 
-# 音频歌词感知分段切割（Audio Lyric Splitter）
+# Audio Lyric Splitter
 
-把整首歌切成每段 10–15 秒、**切点不切唱词**、尽量卡节拍的 mp3 片段，并产出带段内节奏点的 manifest，供 H3 / AI 视频逐段生成（多段音乐连续不重启）。
-
-## 输入（硬要求）
-
-- 音频：mp3/wav/m4a/flac 等 ffmpeg 支持格式。
-- **逐句歌词 SRT**（标准 SubRip：序号行 / `00:00:00,000 --> 00:00:00,000` / 一行或多行歌词 / 空行分块）。
-  - 逐句时间轴是「不切词」的硬约束。没有 SRT 时先取得或生成 SRT，**不要**只靠 BPM/能量切（必切词，已多次验证为死路）。
+歌词感知的节拍对齐 MP3 分段：先拿到逐句歌词时间轴，再分析 BPM/节拍网格，用动态规划把整首歌切成每段 10–15 秒、**绝不切断唱句**、切点尽量落在气口并贴近节拍/小节的片段，输出段内节奏点与字位 manifest，可选打包 zip。
 
 ## 依赖
 
-- Python3 + numpy + scipy（纯 numpy/scipy 分析，**不需要** librosa/pydub）。
-- `ffmpeg`、`ffprobe` 在 PATH（Windows 可用 `winget install Gyan.FFmpeg`）。
-- 检查：`python -c "import numpy,scipy"`、`ffmpeg -version`。
-- Windows 路径含中文/空格/括号时整体加引号；跑中文输出前设 `$env:PYTHONUTF8=1`。
+- Python 3 + `numpy` + `scipy`（仅分析脚本需要）；切割脚本只用标准库。
+- `ffmpeg` / `ffprobe` 在 PATH（找不到时在脚本顶部 `FFMPEG_FALLBACK` 追加绝对路径）。
+- 识别歌词还需 `mediakit-cli`（豆包环境内置，云端 ASR；本地音频由 CLI 自动上传）。
 
-## 工作流（按序执行）
+## 工作流
 
-脚本在本 skill 的 `scripts/` 下。
+### 第 0 步：获取逐句歌词 SRT（必做，先问用户）
 
-**第 1 步：分析 BPM（建议先做）**
+切割的“不切词”完全依赖逐句时间轴，开始前**先问用户能否提供歌词**，按情况处理：
+
+1. **用户提供了逐句 SRT/字幕文件**（标准 SubRip，`HH:MM:SS,mmm --> HH:MM:SS,mmm`）→ 直接进入第 1 步。
+2. **只有歌词文本、没有时间轴** → 时间轴仍需获取：走下面的 ASR 识别得到时间轴，再用用户给的原文逐句替换/校对文字。
+3. **什么都没有（只有音频）** → 用 `scripts/transcribe_lyrics.py` 识别：
+
+   ```
+   python scripts/transcribe_lyrics.py --audio "song.mp3" --language zh --content-type singing
+   # --language: zh(简体) | en(英语) | auto(默认自动探测)
+   # --content-type: singing(默认唱歌) | speech(念白) | auto(自动)
+   ```
+
+   产出与音频同名的 `.srt`（草稿）和 `.asr.json`（含每句置信度），并在终端列出低置信句。
+
+**ASR 草稿必须人工校对后才能切割（硬要求）。** 唱歌（尤其古风/戏曲/慢板/和声/强伴奏）普遍错字，间奏会误识别出“啊”等拟声，多个短句可能被合并成一条长句。校对三件事：对照原词逐句改字 → 删掉间奏里的误识别短句 → 按真实句读拆分长句、核对每句起止边界。未校对的草稿直接切，常出现“约束下无解”或仍然切词。
+
+强伴奏识别过差时，先用 `mediakit-cli audio separate-voice` 分离出人声轨（读取 `byted-mediakit-audio` 的 separate-voice reference），再对人声轨跑识别。宁可请用户补歌词，也不要拿未校对的时间轴硬切。
+
+### 第 1 步：分析 BPM 与节拍网格
+
 ```
 python scripts/analyze_audio.py "song.mp3" --out analysis.json
 ```
-- 输出 `bpm / beat_sec / bar_sec / first_downbeat_sec / bpm_candidates / tested_half_double / low_energy_sec`。
-- **慢板古风/散板**常出现半速与加倍两个都合理的值（如 60.75 与 121.5），自动值可能选错八度：结合听感定夺，必要时在下一步用 `--bpm` 锁定。
 
-**第 2 步：先看方案，不切文件**
+输出 BPM 候选（含半速/加倍）、选定 BPM、首拍、beat/bar/phrase 间隔、低能量间奏区间。
+慢板/古风常把正确速度报成“半速”：看候选里的半/倍速，用 `--bpm`（必要时加 `--first-beat`）锁定正确者。间奏一律以 SRT 的无唱句区间为准。
+
+### 第 2 步：先看方案，确认不切词
+
 ```
 python scripts/cut_by_lyrics.py --audio "song.mp3" --srt "song.srt" --outdir out --plan
+# BPM 不对：--bpm 60.75 [--first-beat 0.488]；也可用 --analysis analysis.json
 ```
-- BPM/首拍来源优先级：`--bpm/--first-beat` > `--analysis analysis.json` > 自动分析。
-- 输出必须同时满足：`全部∈[10,15]=True`、`进入唱词的切点=0`、`被切开的唱句: 无 —— N句全部完整`。
-- BPM 不对：加 `--bpm 60.75`（必要时再加 `--first-beat 0.488`）后重看 plan。
 
-**第 3 步：实切 + manifest + zip**
+`--plan` 只打印切点/段长/每段歌词/切词检查，不切文件。确认“切词 0 处、唱句完整”再继续。
+
+### 第 3 步：实切 + manifest + 打包
+
 ```
 python scripts/cut_by_lyrics.py --audio "song.mp3" --srt "song.srt" --outdir out --title "歌名"
 ```
-- 生成 `segNN_MMmSSpSSs-MMmSSpSSs.mp3`（libmp3lame 192k）与 `cuts_manifest.json`，并在 `out` 同级打包 `<title>_H3分段_N段_不切歌词.zip`（或用 `--zip 路径`）。
-- 脚本末尾用 ffprobe **独立回读自检**（实测段长、求和、逐句完整、无切词）；必须全部通过再交付。
 
-## 常用参数
+去掉 `--plan` 即实切；给 `--title` 额外生成 `<title>_H3分段_N段_不切歌词.zip`。切完自动用 ffprobe 独立自检（实测段长、求和、逐句完整、无切词），不通过以退出码 1 报错。
 
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `--min/--max/--target` | 10 / 15 / 12.5 | 段长上下限与趋优目标（秒） |
-| `--bpm` / `--first-beat` | 自动 | 手动锁定 BPM / 首拍时间（慢板八度定夺、相位纠偏） |
-| `--analysis` | 无 | 读 analyze_audio.py 的 JSON |
-| `--guard` | 0.06 | 气口内切点距两侧唱词的保护秒数，防削下句字头 |
-| `--gap-step` | 0.02 | 句间气口内候选点密采步长 |
-| `--plan` | 关 | 只出方案与校验，不切割 |
-| `--title` / `--zip` | 无 | 打包 zip（自动命名 / 指定路径） |
+## 脚本
 
-## 输出 cuts_manifest.json 结构
+- `scripts/transcribe_lyrics.py`：无歌词时用 mediakit-cli ASR 识别，生成 SRT 草稿 + `.asr.json`，列低置信句；**草稿必须人工校对**。
+- `scripts/analyze_audio.py`：ffmpeg 解码后做 onset 包络自相关测 BPM（半/倍速相位扫描防八度错）、估首拍、列低能量区间。
+- `scripts/cut_by_lyrics.py`：内置标准 SRT 解析器（兼容 UTF-8 BOM/GBK、逗号毫秒、CRLF、`<i>`/`{\an8}` 标签、多行歌词、中英文）；全局动态规划选切点；写 manifest；ffprobe 自检；可选 zip。
 
-```
-{
-  "meta": { source, srt, bpm, beat_sec, bar_sec, phrase_sec, first_downbeat_sec,
-            min_sec, max_sec, target_sec, total_duration, segment_count,
-            accent_legend: {phrase, downbeat, onbeat, offbeat}, note },
-  "segments": [
-    { seg, start, end, length, file,
-      "lyrics": [文本...],
-      "lyric_events": [{text, local_start, local_end, global_start, global_end}],
-      "beats": [{local, global, k, accent}] } ]
-}
-```
-- `beats[].local` 相对段头秒数（H3 段内卡点直接用），`global` 为原曲时间，`k` 为全局拍序号。
-- accent 四级，与 H3 的 8/4/2/1 拍编舞层级对齐：
-  - `phrase`：k%8==0，每 8 拍/2 小节，乐句强拍；
-  - `downbeat`：k%4==0，每 4 拍，小节强拍；
-  - `onbeat`：k%2==0，正拍；`offbeat`：弱拍/反拍。
-- **散板/自由句**：机械节拍网格只作身韵骨架，动作与卡点以 `lyric_events` 的字位为准。
+## 切割规格（默认）
 
-## 硬规则（不可退化）
+每段目标 12.5s、允许 10–15s（`--min/--max/--target` 可调）。合法切点不得落在任何唱句开区间内（两句首尾相接的精确交界允许切）；宽气口（gap≥0.15s）切点须距前后句边界留 0.06s 保护，防止削字头；候选集含 0、总长、安全拍点、零缝交界、气口 0.02s 密采；DP 代价为段长偏离目标的平方，并对贴近小节首拍/普通拍给偏好。**节拍对齐永远让位于“不切词”。**
 
-1. **不切词优先于节拍对齐**。切点合法当且仅当它不落在任何唱句开区间 `(start,end)` 内部；宁可切点不在拍上，也绝不切进唱词。
-2. **零/近零缝连唱**（相邻句 gap < 0.15s）允许切在两句首尾相接的精确交界点；**宽气口**（gap ≥ 0.15s）切点必须落在 `[前句end+guard, 后句start−guard]`，贴后句 start 会削字头。
-3. **间奏/纯器乐段以 SRT 空白为准**。满编曲间奏能量检测常失效，`analyze` 的 `low_energy_sec` 仅作辅助。
-4. 段长用全局 DP 求最优、趋近 target，硬约束 `[min,max]`；候选集 = 拍点 ∪ 句交界 ∪ 气口内 0.02s 密采。
-5. 交付前确认 ffprobe 自检全过。mp3 逐段重编码每段容器时长约 +26~31ms（帧补齐），切点仍在气口，属正常；多段求和通常与原时长差 ≤0.001s。
+## manifest（cuts_manifest.json）
 
-## 排错
+顶层 `meta`（source/srt/bpm/beat_sec/bar_sec/phrase_sec/first_downbeat_sec/min/max/target/total_duration/segment_count/accent_legend/note）；每段 `segments[]` 含：
 
-无解、出现切词、BPM 八度错误、首拍相位偏、SRT 编码/多行、ffmpeg 缺失等，见 `references/troubleshooting.md`。
+- `beats`：`{local, global, k, accent}`，accent 四级 phrase(k%8，8拍/2小节) / downbeat(k%4，小节) / onbeat(k%2) / offbeat；`local` 相对段头，供 H3 段内卡点。
+- `lyric_events`：`{text, local_start, local_end, global_start, global_end}`，逐句字位；散板/自由节奏以字位为准。
+
+## 失败处理
+
+BPM 半速/加倍、“约束下无解”、零缝连唱、散板、ASR 识别质量差或 mediakit-cli 不可用等情况，见 `references/troubleshooting.md`。
