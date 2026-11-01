@@ -148,7 +148,8 @@ class Tokenizer:
             _require(["fugashi", "unidic_lite"], "日语转假名需要：pip install fugashi unidic-lite")
             import unidic_lite
             from fugashi import Tagger
-            self._tagger = Tagger(f"-d {unidic_lite.DICDIR}")
+            # Windows 下 MeCab 会把参数里的反斜杠当转义符吞掉，统一改用正斜杠路径
+            self._tagger = Tagger(f"-d {unidic_lite.DICDIR.replace(chr(92), '/')}")
 
     def _ja_word_pron(self, seg):
         toks = []
