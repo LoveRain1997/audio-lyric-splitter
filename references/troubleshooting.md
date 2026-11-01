@@ -12,6 +12,7 @@
 9. [算法简述与已验证死路（勿退化）](#9-算法简述与已验证死路勿退化)
 10. [非默认场景](#10-非默认场景)
 11. [歌词识别（ASR）：没有歌词 SRT 时](#11-歌词识别asr没有歌词-srt-时)
+12. [本地多语种对齐（align_lyrics_local.py）](#12-本地多语种对齐align_lyrics_localpy)
 
 ---
 
@@ -134,3 +135,56 @@ plan 末尾的两行是硬验收：
 - `mediakit-cli` 找不到或任务报鉴权错误：需在装有 MediaKit 的豆包环境运行；否则退回请用户提供歌词/字幕。本地自装 faster-whisper 等不是本 skill 的依赖，不默认安装。
 - 云端识别会上传音频；涉及未公开/敏感素材时，先告知用户并取得同意。
 - 纯音乐/无人声段不应有歌词；草稿里的间奏拟声句删除即可，间奏位置仍以校对后 SRT 的空白段为准。
+
+## 12. 本地多语种对齐（align_lyrics_local.py）
+
+入口：`scripts/align_lyrics_local.py`。当用户给了歌词文本但没有时间轴，尤其是日语/韩语/俄语等云端 ASR 不支持的语种，或需要高精度时，**默认走它**。它不做“识别歌词”，而是用 wav2vec2 CTC 对**用户提供的原文**做强制对齐（forced alignment），因此文字 100% 用原文，只定位时间。
+
+### 12.1 依赖与安装
+
+- `transformers`、`faster-whisper`、`fugashi`+`unidic-lite`（日语注音）、`numpy`：`pip install transformers faster-whisper fugashi unidic-lite`。
+- `torch`+`torchaudio`：CPU 版即可，**不要默认装 CUDA 版**（大、慢）。
+- 模型首次运行自动从 HuggingFace 下载；国内务必先 `export HF_ENDPOINT=https://hf-mirror.com`。
+- 音频统一用 ffmpeg 转 16k mono wav 再 numpy 读取（脚本已处理）。
+
+**torch CPU 国内安装（已实测，官方源和多数镜像会卡/403/给 CUDA 版）：**
+
+1. 官方 `download.pytorch.org/whl/cpu` 常超时；清华 pypi 的大 wheel 403；阿里 pypi simple 给 CUDA 版且慢。
+2. 可用路径：阿里云 pytorch 扁平目录 `https://mirrors.aliyun.com/pytorch-wheels/cpu/`（**不是** PEP 503 simple 索引，用 `--index-url` 会报 “No matching distribution”）。
+3. 正确做法：浏览器或 `curl` 打开该目录页，找到与 Python 版本匹配的 `torch-<ver>+cpu-cpXXX-...whl`、`torchaudio-<ver>+cpu-cpXXX-...whl`，**直接下载 wheel 后本地安装**：
+   ```
+   pip install ./torch-2.11.0+cpu-cp312-cp312-manylinux_2_28_x86_64.whl
+   pip install ./torchaudio-2.11.0+cpu-cp312-cp312-manylinux_2_28_x86_64.whl
+   ```
+   注意 URL 里的 `+` 需编码成 `%2B`；目录页 HTML 里 `+` 可能显示为 `&#43;`。装完用 `python -c "import torch;print(torch.__version__, torch.cuda.is_available())"` 确认是 `+cpu`、`cuda False`。
+
+**PyAV 兼容（faster-whisper 读文件报 `metadata_errors`）：** 新版 PyAV 与 faster-whisper 的 `decode_audio` 不兼容，`transcribe(文件路径)` 会抛 `open() got an unexpected keyword argument 'metadata_errors'`。规避：**不要传文件路径**，统一用 ffmpeg 转 16k mono wav，再用 numpy 读出数组传给 `transcribe(ndarray)`（脚本已这样做）。读 wav 用 `np.frombuffer(...,np.int16)` 后跳过 44 字节头（`[22:]` 个 int16 采样）。
+
+**faster-whisper 参数：** 1.2.x 用 `vad_parameters=`（不是 `vad_options`/`vad_params`）；尾段定位要 `vad_filter=False` + `initial_prompt=<正确尾句>`。
+
+### 12.2 已验证死路（勿退化）
+
+1. **云端 ASR 不支持日语**：`mediakit-cli video asr-subtitles` 只有 cmn-Hans-CN / eng-US；`--language auto` 把日语音节误识别成英文/罗马音，低置信、草稿不可用。
+2. **不对原始混音直接识别/对齐**：直接对原混音跑 faster-whisper 会大量漏句（实测只识别到 20 多秒就漏）。**先 `audio separate-voice` 分离人声**是决定性提升；分离人声后 medium 仍可能漏副歌，large-v3 主歌词级锚点准确，但大合唱齐唱段仍稀疏。
+3. **齐唱结尾全曲 CTC 会“摊薄”**：结尾大合唱常把最后副歌尾句再唱一遍（音频两遍、文本只有一遍）。全曲一次 CTC 会把单遍文本摊到两遍，越往后越慢（实测末 4 句被错放到 148/157/166 而真首遍是 140/143/146 或过门后的 151）。脚本已自动“取首遍”，不要把第二遍时间当歌词。
+4. **尾段检测窗不能太长**：窗口若一直延伸到曲末（>约 34s，含第二遍后大段尾奏/静音），Whisper 会把第二遍幻觉成“花火/ラララ”等，反而检测失败。默认 `--tail-win 34`；先在短窗内定位首遍结束点，再只对“首遍音频”对齐。
+5. **贪心顺序匹配会因单字注音差异雪崩**：fugashi 对整句注音正确（星空→ほしぞら、思い出の出→で），但对 Whisper 切出的单字可能取音读（空→そら、出→しゅつ、永→なが）。必须用全局 DTW（脚本 `dtw_map`）容忍插入/删除/替换，不能逐字贪心。
+6. **长过门/无词拖音不是唱句**：副歌与 Outro 之间常有数秒过门（人声轨里有中等能量的和声/气声残留，但 CTC 帧级几乎全 blank、Whisper 多次一致跳过）。`initial_prompt` 过强时 Whisper 偶发会把过门幻觉成下一句首词（提前 3–5 秒）。脚本用“行首锚点 + CTC 门控（锚点不得早于 CTC 行首 1s）”剔除这类幻觉，**判断行首以 CTC 帧级音节与多次 Whisper 一致为准，不要采信心声/气声里的单个词**。
+7. **汉字单字 Whisper 行首**：纯首遍短窗里行首汉字（星/永/約）稳定，含第二遍的长窗可能把上一句尾音误判成首行字（如把英文 “Summer” 听成“星”）。门控以 CTC 行首为准，并用“只在首遍区间、时间单调”匹配；尾句若是假名开头（また…），用词首假名匹配。
+
+### 12.3 输入歌词约定
+
+- txt 每行一句；独占一行的 `[Verse]`/`[Chorus]`/`[Mikoto]`/`[Both]` 等段落/角色标记会被自动剔除，行内 `[xxx]` 也会被去除。
+- **一行若包含两个短句（如开场“せーの！ 夏が来た！”在同一物理行），需先手工拆成两行**，否则只会得到一个时间戳、两句被并成一条唱句。
+- JSON 也支持：`[["句1",""], ...]` 或 `[{"text":"句","sec":""}, ...]`。
+- 日语少量英文按日式发音映射：`--en-kana "summer=さまー,days=でいず"`，否则英文词在日语 CTC 词表里是 unk。
+
+### 12.4 其他语种
+
+- 内置 ja/zh/en 模型（见脚本 `ALIGN_MODELS`）；其他语种传 `--align-model <HF id>` 指定一个**字符/假名级 wav2vec2 CTC 模型**（注意：英文这类字母级模型的 token 化与日语不同，`--language` 与模型要匹配）。
+- 中文/英文若云端 ASR 草稿质量不够，同样可直接用本地对齐（只信原文、不识别字）。
+- 产物 `.align.json` 含行级与字级时间（`rows[].chars`），可直接核对；终端会打印能量校验结果（行起点落在低能量区即警告）。
+
+### 12.5 对齐后仍要跑切割自检
+
+拿到 `.srt` 后照常用 `cut_by_lyrics.py --plan` 确认“进入唱词的切点=0、唱句全部完整”，再实切。日语 SRT 与解析器无关、可直接使用。
