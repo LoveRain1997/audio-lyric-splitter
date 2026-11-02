@@ -1,6 +1,6 @@
 ---
 name: audio-lyric-splitter
-description: "歌词感知、节拍对齐的 MP3 分段工具，用于把一整首歌切成 10–15 秒、绝不切断唱句、切点卡在气口/节拍上的 H3/多段视频素材，并输出每段段内节奏点(beats)与字位(lyric_events)的 manifest 和打包 zip。开始前必须先确认用户是否提供逐句歌词 SRT：有 SRT 直接切；有歌词文本但无时间轴（含日语/韩语/俄语等非中英语种，或需要高精度）时，默认用 scripts/align_lyrics_local.py 本地管线（分离人声→faster-whisper→wav2vec2 CTC 对原文强制对齐→结尾齐唱重复取首遍→能量校验）直接产出 LRC+SRT 再切；什么都没有或中/英文歌可用 scripts/transcribe_lyrics.py 经 mediakit-cli 云端 ASR（唱歌 singing、中/英文）出草稿，人工校对后再切。触发场景：歌曲/音频分段、按歌词切割、不切歌词、节拍卡点、H3 多段、歌词时间轴 SRT/LRC、识别歌词、日语歌词对齐、语音转字幕/ASR、CTC 强制对齐、生成 cuts_manifest.json、段内节奏点。"
+description: "歌词感知、节拍对齐的 MP3 分段工具，用于把一整首歌切成 10–15 秒、绝不切断唱句、切点卡在气口/节拍上的 H3/多段视频素材，并输出每段段内节奏点(beats)与字位(lyric_events)的 manifest 和打包 zip。开始前必须先确认用户是否提供逐句歌词 SRT：有 SRT 直接切；有歌词文本但无时间轴（含日语/韩语/俄语等非中英语种，或需要高精度）时，默认用 scripts/align_lyrics_local.py 本地管线（分离人声→faster-whisper→wav2vec2 CTC 对原文强制对齐→结尾齐唱重复取首遍→能量校验）直接产出 LRC+SRT 再切；什么都没有或中/英文歌可用 scripts/transcribe_lyrics.py 经 mediakit-cli 云端 ASR（唱歌 singing、中/英文）出草稿，人工校对后再切。需要真实鼓点/编曲事件（而非等间隔网格）时，用 scripts/detect_drum_events.py 经 demucs 鼓轨分离 + librosa onset + 频谱聚类反推 kick/snare/hihat/other 事件并标注置信度，再用 scripts/merge_drum_manifest.py 并入 manifest。触发场景：歌曲/音频分段、按歌词切割、不切歌词、节拍卡点、H3 多段、歌词时间轴 SRT/LRC、识别歌词、日语歌词对齐、语音转字幕/ASR、CTC 强制对齐、生成 cuts_manifest.json、段内节奏点、鼓点反推、鼓组转录、onset 起音检测、Kick/Snare/HiHat 时间戳、编曲事件表、drum_events。"
 ---
 
 # Audio Lyric Splitter
@@ -13,6 +13,7 @@ description: "歌词感知、节拍对齐的 MP3 分段工具，用于把一整�
 - `ffmpeg` / `ffprobe` 在 PATH（找不到时在脚本顶部 `FFMPEG_FALLBACK` 追加绝对路径）。
 - 云端识别（可选）：`mediakit-cli`（豆包环境内置，云端 ASR；本地音频由 CLI 自动上传），**仅支持中文（cmn-Hans-CN）/英文（eng-US）**。
 - 本地对齐（`align_lyrics_local.py`，无歌词/无时间轴默认路径）：`torch`+`torchaudio`（CPU 版即可）、`transformers`、`faster-whisper`、`fugashi`+`unidic-lite`（日语注音）、`numpy`。首次运行自动下载 wav2vec2 CTC 模型；国内设 `HF_ENDPOINT=https://hf-mirror.com`。安装踩坑（torch CPU 国内源、PyAV 兼容等）见 `references/troubleshooting.md` 第 12 节。
+- 鼓点反推（`detect_drum_events.py`，可选）：`demucs`（分轨取鼓轨，依赖 torch）、`librosa`（onset 检测，依赖 `numba`）、`scikit-learn`（频谱聚类）、`soundfile`。demucs 首次运行自动下载 htdemucs 模型。安装与网络踩坑见 `references/troubleshooting.md` 第 13 节。
 
 ## 工作流
 
@@ -86,12 +87,44 @@ python scripts/cut_by_lyrics.py --audio "song.mp3" --srt "song.srt" --outdir out
 
 去掉 `--plan` 即实切；给 `--title` 额外生成 `<title>_H3分段_N段_不切歌词.zip`。切完自动用 ffprobe 独立自检（实测段长、求和、逐句完整、无切词），不通过以退出码 1 报错。
 
+### 第 4 步（可选）：鼓点/起音事件反推
+
+manifest 默认的 `beats` 是按 BPM 推算的**等间隔理论网格**，不是真实鼓点，也不区分鼓件。需要真实事件时，对音频做数据驱动反推（**禁止凭网格编造 Kick/Snare 时间**）：
+
+1. **demucs 分轨取鼓轨**（关键，去除人声与旋律乐器）：
+
+   ```
+   python -m demucs --two-stems drums -o workdir "song.mp3"
+   # 产物 workdir/htdemucs/song/drums.wav
+   ```
+
+2. **onset 检测 + 频谱聚类**：
+
+   ```
+   python scripts/detect_drum_events.py --drum workdir/htdemucs/song/drums.wav \
+       --out drum_events.json
+   # 内部：librosa onset_detect -> 节拍网格门限 -> 频谱特征 KMeans 4 类
+   # 输出 kick/snare/hihat/other，每事件带 confidence/strength/beat_index/grid_offset
+   ```
+
+3. **并入 manifest**：
+
+   ```
+   python scripts/merge_drum_manifest.py   # 路径在脚本内按实际位置配置
+   ```
+
+   产出含 `drum_events`（全局）、`drum_detection`（方法元数据）及每段段内 `drum_events`（带 `local`）的完整 JSON。
+
+**边界与诚实要求**：这是启发式反推、非逐音真值；`other` 是不满足 kick/snare/hihat 典型频谱的打击（可能含 tom/打击乐/弱奏/分离残留），不强行归类；弱音可能漏检。检测到的实际 tempo 若与 `analyze_audio` 结果不一致，以检测为准并在 `drum_detection` 注明，不得掩盖。
+
 ## 脚本
 
 - `scripts/align_lyrics_local.py`：**无时间轴时的默认入口**。人声分离→faster-whisper 锚点→wav2vec2 CTC 对给定原文强制对齐→结尾齐唱重复取首遍→能量校验，输出 LRC + SRT + `.align.json`。支持日/中/英（内置模型）及任意字符型 wav2vec2 语种（`--align-model`）；不依赖“识别出歌词”，对原文对齐，因此齐唱、强伴奏、长拖音下主歌仍逐句准。
 - `scripts/transcribe_lyrics.py`：中/英文歌、什么歌词都没有时，用 mediakit-cli 云端 ASR 识别，生成 SRT 草稿 + `.asr.json`，列低置信句；**草稿必须人工校对**；不支持日语等非中英语种。
 - `scripts/analyze_audio.py`：ffmpeg 解码后做 onset 包络自相关测 BPM（半/倍速相位扫描防八度错）、估首拍、列低能量区间。
 - `scripts/cut_by_lyrics.py`：内置标准 SRT 解析器（兼容 UTF-8 BOM/GBK、逗号毫秒、CRLF、`<i>`/`{\an8}` 标签、多行歌词、中英文，日文同样适用）；全局动态规划选切点；写 manifest；ffprobe 自检；可选 zip。
+- `scripts/detect_drum_events.py`：在 demucs 鼓轨上做 librosa onset 峰值检测、节拍网格门限与频谱特征 KMeans(4) 聚类，输出 kick/snare/hihat/other 事件及置信度；全部基于真实音频、可复现，不编造。
+- `scripts/merge_drum_manifest.py`：把鼓事件并入 cuts_manifest，生成全局与段内（`local`）视图，并做归属一致性校验。
 
 ## 切割规格（默认）
 
@@ -101,8 +134,9 @@ python scripts/cut_by_lyrics.py --audio "song.mp3" --srt "song.srt" --outdir out
 
 顶层 `meta`（source/srt/bpm/beat_sec/bar_sec/phrase_sec/first_downbeat_sec/min/max/target/total_duration/segment_count/accent_legend/note）；每段 `segments[]` 含：
 
-- `beats`：`{local, global, k, accent}`，accent 四级 phrase(k%8，8拍/2小节) / downbeat(k%4，小节) / onbeat(k%2) / offbeat；`local` 相对段头，供 H3 段内卡点。
+- `beats`：`{local, global, k, accent}`，accent 四级 phrase(k%8，8拍/2小节) / downbeat(k%4，小节) / onbeat(k%2) / offbeat；`local` 相对段头，供 H3 段内卡点。**注意 beats 是等间隔理论网格，不是真实鼓点。**
 - `lyric_events`：`{text, local_start, local_end, global_start, global_end}`，逐句字位；散板/自由节奏以字位为准。
+- `drum_events`（可选，经第 4 步反推）：全局事件为 `{time, type, confidence, strength, beat_index, grid_offset}`；每段段内视图另含 `local`（相对段头）。`type` 为 kick/snare/hihat/other；`grid_offset` 正=拖拍、负=抢拍。顶层 `drum_detection` 记录方法、参数、置信度模型与局限。
 
 ## 失败处理
 

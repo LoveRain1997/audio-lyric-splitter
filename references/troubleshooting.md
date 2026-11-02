@@ -13,6 +13,7 @@
 10. [非默认场景](#10-非默认场景)
 11. [歌词识别（ASR）：没有歌词 SRT 时](#11-歌词识别asr没有歌词-srt-时)
 12. [本地多语种对齐（align_lyrics_local.py）](#12-本地多语种对齐align_lyrics_localpy)
+13. [鼓点反推（detect_drum_events.py）](#13-鼓点反推detect_drum_eventspy)
 
 ---
 
@@ -188,3 +189,32 @@ plan 末尾的两行是硬验收：
 ### 12.5 对齐后仍要跑切割自检
 
 拿到 `.srt` 后照常用 `cut_by_lyrics.py --plan` 确认“进入唱词的切点=0、唱句全部完整”，再实切。日语 SRT 与解析器无关、可直接使用。
+
+## 13. 鼓点反推（detect_drum_events.py）
+
+### 13.1 依赖与安装
+
+```
+pip install demucs librosa scikit-learn soundfile
+# librosa 会带 numba/llvmlite；numba 0.68+ 已支持 Python 3.13，优先用预编译 wheel
+pip install --only-binary :all: librosa
+```
+
+demucs 首次运行自动下载 htdemucs 模型（torch.hub，默认 `dl.fbaipublicfiles.com`）。
+
+### 13.2 网络与平台坑（已验证）
+
+- **Clash/系统代理导致连接挂死**：进程级 `HTTP_PROXY` 为空但系统代理仍可能拦截，大文件下载出现 `CloseWait` 卡死。运行前设 `NO_PROXY=*` 直连。
+- **HF Xet 401**：若链路经 HuggingFace，设 `HF_HUB_DISABLE_XET=1`；国内加 `HF_ENDPOINT=https://hf-mirror.com`。
+- **新版 torchaudio（2.11+）默认要 torchcodec**，未装则 `torchaudio.load` 报 `ImportError`。本脚本不依赖它，统一用 `ffmpeg` 解码为 wav 再 `scipy.io.wavfile` 读取。
+
+### 13.3 已验证死路（勿退化）
+
+- **对原始混音直接做宽松 onset 检测**：钢琴/人声/铃铛/弦乐大量误报（实测 996 事件、与网格吻合度差）。必须先用 demucs 取鼓轨，或显著收紧阈值。
+- **网格门限不能用 16 分网格 + 大容差**：16 分网格间距（~0.084s）小于容差（0.1s）时门限形同虚设、全事件通过。应在离散 onset 上用合理容差（如 0.09s）的节拍网格门限。
+- **不要按 BPM 等间隔网格反推 Kick/Snare**：网格只给理论拍点，不区分鼓件、不含 humanize。真实事件必须来自音频 onset 检测。
+- **`other` 不强行归类**：频谱特征不满足 kick/snare/hihat 典型定义的事件保留为 other（可能含 tom/打击乐/弱奏/分离残留）。
+
+### 13.4 可靠性边界
+
+启发式反推是**估计**而非逐音真值，可能漏弱音、误分类；置信度按 onset 强度分位 + 网格贴合 + 类型典型性综合。实测 tempo 若与 `analyze_audio` 不一致（本案例实测约 162–167，原分析 178 偏高），以检测为准并在 `drum_detection` 注明。需要更高精度时再引入专门的 drum transcription 模型对比。
