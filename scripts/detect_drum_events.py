@@ -87,7 +87,7 @@ def detect(drum_path, delta=0.3, grid_tol=0.09, sr=22050, hop=512):
         "type_counts": dict(Counter(e["type"] for e in events)),
         "confidence_model": "0.45 base + onset-strength rank + grid alignment + type typicality",
         "limitations": "启发式反推非逐音真值；other 含 tom/打击乐/弱奏/分离残留；可能漏弱音；"
-                       "实测 tempo~161.5 与原分析 178 网格存在差异，以本检测为准。",
+                       "实测 tempo 见 detected_tempo_bpm，若与节拍分析不一致以本检测为准。",
     }
     return events, meta
 

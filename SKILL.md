@@ -1,11 +1,11 @@
 ---
 name: audio-lyric-splitter
-description: "歌词感知、节拍对齐的 MP3 分段工具，用于把一整首歌切成 10–15 秒、绝不切断唱句、切点卡在气口/节拍上的 H3/多段视频素材，并输出每段段内节奏点(beats)与字位(lyric_events)的 manifest 和打包 zip。开始前必须先确认用户是否提供逐句歌词 SRT：有 SRT 直接切；有歌词文本但无时间轴（含日语/韩语/俄语等非中英语种，或需要高精度）时，默认用 scripts/align_lyrics_local.py 本地管线（分离人声→faster-whisper→wav2vec2 CTC 对原文强制对齐→结尾齐唱重复取首遍→能量校验）直接产出 LRC+SRT 再切；什么都没有或中/英文歌可用 scripts/transcribe_lyrics.py 经 mediakit-cli 云端 ASR（唱歌 singing、中/英文）出草稿，人工校对后再切。需要真实鼓点/编曲事件（而非等间隔网格）时，用 scripts/detect_drum_events.py 经 demucs 鼓轨分离 + librosa onset + 频谱聚类反推 kick/snare/hihat/other 事件并标注置信度，再用 scripts/merge_drum_manifest.py 并入 manifest。触发场景：歌曲/音频分段、按歌词切割、不切歌词、节拍卡点、H3 多段、歌词时间轴 SRT/LRC、识别歌词、日语歌词对齐、语音转字幕/ASR、CTC 强制对齐、生成 cuts_manifest.json、段内节奏点、鼓点反推、鼓组转录、onset 起音检测、Kick/Snare/HiHat 时间戳、编曲事件表、drum_events。"
+description: "歌词感知、节拍对齐的 MP3 分段工具，用于把一整首歌切成 10–15 秒、绝不切断唱句、切点卡在气口/节拍上的 H3/多段视频素材，并输出每段段内节奏点(beats)与字位(lyric_events)的 manifest 和打包 zip。开始前必须先确认用户是否提供逐句歌词 SRT：有 SRT 直接切；有歌词文本但无时间轴（含日语/韩语/俄语等非中英语种，或需要高精度）时，默认用 scripts/align_lyrics_local.py 本地管线（分离人声→faster-whisper→wav2vec2 CTC 对原文强制对齐→结尾齐唱重复取首遍→能量校验）直接产出 LRC+SRT 再切；什么都没有或中/英文歌可用 scripts/transcribe_lyrics.py 经 mediakit-cli 云端 ASR（唱歌 singing、中/英文）出草稿，人工校对后再切。默认（非可选）执行 scripts/detect_drum_events.py，经 demucs 鼓轨分离 + librosa onset + 频谱聚类反推 kick/snare/hihat/other 事件并标注置信度，再用 scripts/merge_drum_manifest.py 并入 manifest 后重新打包。非歌词驱动的切割（用户未提供歌词、口播、纯音乐等）也须在切分后经 ASR 识别并随分段交付歌词 SRT 与 manifest，纯无人声段除外。触发场景：歌曲/音频分段、按歌词切割、不切歌词、节拍卡点、H3 多段、歌词时间轴 SRT/LRC、识别歌词、日语歌词对齐、语音转字幕/ASR、CTC 强制对齐、生成 cuts_manifest.json、段内节奏点、鼓点反推、鼓组转录、onset 起音检测、Kick/Snare/HiHat 时间戳、编曲事件表、drum_events。"
 ---
 
 # Audio Lyric Splitter
 
-歌词感知的节拍对齐 MP3 分段：先拿到逐句歌词时间轴，再分析 BPM/节拍网格，用动态规划把整首歌切成每段 10–15 秒、**绝不切断唱句**、切点尽量落在气口并贴近节拍/小节的片段，输出段内节奏点与字位 manifest，可选打包 zip。
+歌词感知的节拍对齐 MP3 分段：先拿到逐句歌词时间轴，再分析 BPM/节拍网格，用动态规划把整首歌切成每段 10–15 秒、**绝不切断唱句**、切点尽量落在气口并贴近节拍/小节的片段，输出段内节奏点与字位 manifest，并默认反推真实鼓点后打包 zip。非歌词驱动的切割，切分后也须交付 ASR 识别的歌词（规则见第 0 步）。
 
 ## 依赖
 
@@ -13,7 +13,7 @@ description: "歌词感知、节拍对齐的 MP3 分段工具，用于把一整�
 - `ffmpeg` / `ffprobe` 在 PATH（找不到时在脚本顶部 `FFMPEG_FALLBACK` 追加绝对路径）。
 - 云端识别（可选）：`mediakit-cli`（豆包环境内置，云端 ASR；本地音频由 CLI 自动上传），**仅支持中文（cmn-Hans-CN）/英文（eng-US）**。
 - 本地对齐（`align_lyrics_local.py`，无歌词/无时间轴默认路径）：`torch`+`torchaudio`（CPU 版即可）、`transformers`、`faster-whisper`、`fugashi`+`unidic-lite`（日语注音）、`numpy`。首次运行自动下载 wav2vec2 CTC 模型；国内设 `HF_ENDPOINT=https://hf-mirror.com`。安装踩坑（torch CPU 国内源、PyAV 兼容等）见 `references/troubleshooting.md` 第 12 节。
-- 鼓点反推（`detect_drum_events.py`，可选）：`demucs`（分轨取鼓轨，依赖 torch）、`librosa`（onset 检测，依赖 `numba`）、`scikit-learn`（频谱聚类）、`soundfile`。demucs 首次运行自动下载 htdemucs 模型。安装与网络踩坑见 `references/troubleshooting.md` 第 13 节。
+- 鼓点反推（`detect_drum_events.py`，**默认执行、非可选**）：`demucs`（分轨取鼓轨，依赖 torch）、`librosa`（onset 检测，依赖 `numba`）、`scikit-learn`（频谱聚类）、`soundfile`。demucs 首次运行自动下载 htdemucs 模型。安装与网络踩坑见 `references/troubleshooting.md` 第 13 节。
 
 ## 工作流
 
@@ -36,6 +36,8 @@ description: "歌词感知、节拍对齐的 MP3 分段工具，用于把一整�
 **ASR 草稿（第 3 条）必须人工校对后才能切割（硬要求）。** 唱歌（尤其古风/戏曲/慢板/和声/强伴奏）普遍错字，间奏会误识别出“啊”等拟声，多个短句可能被合并成一条长句。校对三件事：对照原词逐句改字 → 删掉间奏里的误识别短句 → 按真实句读拆分长句、核对每句起止边界。未校对的草稿直接切，常出现“约束下无解”或仍然切词。
 
 本地对齐（第 2 条）产物也应快速过一遍 `.align.json` 与终端的能量校验：主歌通常逐句准确；结尾齐唱/长过门已由脚本自动处理，但仍建议抽查首句、尾句与大合唱段。
+
+**非歌词驱动切割的歌词交付（硬要求）**：当本次切割不是由用户歌词驱动（用户未提供任何歌词/SRT，含口播、念白、纯音乐等），仍须先按第 3 条（中/英文走云端 ASR）或本地管线识别出歌词时间轴再切割，并在交付物中同时给出独立 `.srt` 歌词文件与含 `lyric_events` 的 manifest，不得只给切好的音频。纯无人声/纯器乐段 ASR 无输出时不编造歌词，改以节拍/鼓点标注。
 
 ### 第 0 步补充：本地多语种对齐（align_lyrics_local.py，无时间轴默认）
 
@@ -87,9 +89,9 @@ python scripts/cut_by_lyrics.py --audio "song.mp3" --srt "song.srt" --outdir out
 
 去掉 `--plan` 即实切；给 `--title` 额外生成 `<title>_H3分段_N段_不切歌词.zip`。切完自动用 ffprobe 独立自检（实测段长、求和、逐句完整、无切词），不通过以退出码 1 报错。
 
-### 第 4 步（可选）：鼓点/起音事件反推
+### 第 4 步（默认执行）：鼓点/起音事件反推
 
-manifest 默认的 `beats` 是按 BPM 推算的**等间隔理论网格**，不是真实鼓点，也不区分鼓件。需要真实事件时，对音频做数据驱动反推（**禁止凭网格编造 Kick/Snare 时间**）：
+manifest 的 `beats` 是按 BPM 推算的**等间隔理论网格**，不是真实鼓点，也不区分鼓件。**第 3 步实切后默认对音频做数据驱动反推**，再把结果并入 manifest 并重新打包 zip（**禁止凭网格编造 Kick/Snare 时间**）：
 
 1. **demucs 分轨取鼓轨**（关键，去除人声与旋律乐器）：
 
@@ -113,7 +115,7 @@ manifest 默认的 `beats` 是按 BPM 推算的**等间隔理论网格**，不�
    python scripts/merge_drum_manifest.py   # 路径在脚本内按实际位置配置
    ```
 
-   产出含 `drum_events`（全局）、`drum_detection`（方法元数据）及每段段内 `drum_events`（带 `local`）的完整 JSON。
+   产出含 `drum_events`（全局）、`drum_detection`（方法元数据）及每段段内 `drum_events`（带 `local`）的完整 JSON。归属校验通过后，用该完整 manifest 替换分段目录中的 `cuts_manifest.json` 并重新打包 zip（9 个 MP3 保持不变）。
 
 **边界与诚实要求**：这是启发式反推、非逐音真值；`other` 是不满足 kick/snare/hihat 典型频谱的打击（可能含 tom/打击乐/弱奏/分离残留），不强行归类；弱音可能漏检。检测到的实际 tempo 若与 `analyze_audio` 结果不一致，以检测为准并在 `drum_detection` 注明，不得掩盖。
 
@@ -136,7 +138,7 @@ manifest 默认的 `beats` 是按 BPM 推算的**等间隔理论网格**，不�
 
 - `beats`：`{local, global, k, accent}`，accent 四级 phrase(k%8，8拍/2小节) / downbeat(k%4，小节) / onbeat(k%2) / offbeat；`local` 相对段头，供 H3 段内卡点。**注意 beats 是等间隔理论网格，不是真实鼓点。**
 - `lyric_events`：`{text, local_start, local_end, global_start, global_end}`，逐句字位；散板/自由节奏以字位为准。
-- `drum_events`（可选，经第 4 步反推）：全局事件为 `{time, type, confidence, strength, beat_index, grid_offset}`；每段段内视图另含 `local`（相对段头）。`type` 为 kick/snare/hihat/other；`grid_offset` 正=拖拍、负=抢拍。顶层 `drum_detection` 记录方法、参数、置信度模型与局限。
+- `drum_events`（默认，经第 4 步反推）：全局事件为 `{time, type, confidence, strength, beat_index, grid_offset}`；每段段内视图另含 `local`（相对段头）。`type` 为 kick/snare/hihat/other；`grid_offset` 正=拖拍、负=抢拍。顶层 `drum_detection` 记录方法、参数、置信度模型与局限。
 
 ## 失败处理
 
